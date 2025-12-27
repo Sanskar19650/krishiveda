@@ -1,0 +1,7 @@
+{
+  "name": "Krishivedaḥ (कृषिवेदः)",
+  "description": "An AI-enabled digital agriculture platform for sowing analysis, soil testing, e-commerce, and live market rates.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
