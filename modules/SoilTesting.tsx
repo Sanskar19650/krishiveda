@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo } from 'react';
 import { Language, translations } from '../translations';
 import { getFertilizerRecommendation } from '../services/gemini';
 
@@ -12,6 +12,23 @@ import {
   serverTimestamp
 } from "firebase/firestore";
 
+/* ===============================
+   RAZORPAY LOADER
+   =============================== */
+const loadRazorpay = () => {
+  return new Promise<boolean>((resolve) => {
+    if ((window as any).Razorpay) {
+      resolve(true);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+    script.onload = () => resolve(true);
+    script.onerror = () => resolve(false);
+    document.body.appendChild(script);
+  });
+};
+
 interface SoilTestingProps {
   lang: Language;
   user?: any;
@@ -20,22 +37,24 @@ interface SoilTestingProps {
 const SoilTesting: React.FC<SoilTestingProps> = ({ lang, user }) => {
   const t = translations[lang];
 
-  // Steps: 1: Booking, 2: Payment, 3: Collection/Lab, 4: Upload Report, 5: AI Results
+  // Steps: 1: Booking, 2: Payment, 3: Collection, 4: Upload, 5: AI
   const [step, setStep] = useState(1);
+  const [errors, setErrors] = useState<Record<string, string>>({});
 
-  // Booking Form State
+  /* Booking State */
   const [farmerName, setFarmerName] = useState(user?.fullName || '');
   const [testArea, setTestArea] = useState('');
+  const [areaUnit, setAreaUnit] = useState('Acres'); // New State for Area Unit
   const [bookingDate, setBookingDate] = useState('');
   const [location, setLocation] = useState(user?.address || '');
 
-  // Payment State
+  /* Payment State */
   const [paymentMethod, setPaymentMethod] = useState<'upi' | 'card' | 'netbanking'>('upi');
   const [isProcessingPayment, setIsProcessingPayment] = useState(false);
 
-  // Tracking, Firestore & AI State
+  /* AI & Reporting State */
   const [bookingRef, setBookingRef] = useState<string | null>(null);
-  const [docId, setDocId] = useState<string | null>(null); // Firestore Document ID
+  const [docId, setDocId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [reportText, setReportText] = useState('');
   const [recommendation, setRecommendation] = useState<string | null>(null);
@@ -44,15 +63,55 @@ const SoilTesting: React.FC<SoilTestingProps> = ({ lang, user }) => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   /* ===============================
-     STEP 1: BOOKING (Firestore Create)
+     📅 CALENDAR CONSTRAINTS (Today to +1 Month)
+     =============================== */
+  const dateLimits = useMemo(() => {
+    const today = new Date();
+    const future = new Date();
+    future.setMonth(future.getMonth() + 1);
+
+    return {
+      min: today.toISOString().split('T')[0],
+      max: future.toISOString().split('T')[0]
+    };
+  }, []);
+
+  /* ===============================
+     VALIDATION LOGIC
+     =============================== */
+  const validateBooking = () => {
+    const newErrors: Record<string, string> = {};
+    if (farmerName.trim().length < 3) newErrors.farmerName = "Enter valid full name (min 3 chars)";
+    if (!testArea || parseFloat(testArea) <= 0) newErrors.testArea = "Required";
+    if (!bookingDate) newErrors.bookingDate = "Required";
+    if (location.trim().length < 10) newErrors.location = "Provide detailed address/landmark";
+
+    setErrors(newErrors);
+    return Object.keys(newErrors).length === 0;
+  };
+
+  const handleInputChange = (setter: (val: string) => void, field: string, value: string) => {
+    setter(value);
+    if (errors[field]) {
+      setErrors(prev => {
+        const updated = { ...prev };
+        delete updated[field];
+        return updated;
+      });
+    }
+  };
+
+  /* ===============================
+     STEP 1: BOOKING
      =============================== */
   const handleBook = async () => {
-    if (!farmerName || !testArea || !bookingDate || !location) return;
+    if (!validateBooking()) return;
 
     try {
       const ref = await addDoc(collection(db, "soil_tests"), {
         farmerName,
         testArea: parseFloat(testArea),
+        areaUnit, // Stored in Firestore
         bookingDate,
         location,
         userId: user?.uid || null,
@@ -61,79 +120,82 @@ const SoilTesting: React.FC<SoilTestingProps> = ({ lang, user }) => {
       });
 
       setDocId(ref.id);
-      setStep(2); // Go to Payment
-    } catch (error) {
-      console.error("Booking failed:", error);
-      alert("Error saving booking. Please check your connection.");
+      setStep(2);
+    } catch (e) {
+      alert("Booking failed.");
     }
   };
 
   /* ===============================
-     STEP 2: PAYMENT (Firestore Update)
+     STEP 2: PAYMENT (RAZORPAY)
      =============================== */
   const handlePayment = async () => {
     setIsProcessingPayment(true);
+    const loaded = await loadRazorpay();
+    if (!loaded) {
+      alert("Payment system failed to load");
+      setIsProcessingPayment(false);
+      return;
+    }
 
-    // Simulate Payment Gateway delay
-    setTimeout(async () => {
-      const refNo = "KV-" + Math.floor(Math.random() * 90000 + 10000);
-      setBookingRef(refNo);
-
-      try {
-        if (docId) {
-          await updateDoc(doc(db, "soil_tests", docId), {
-            paymentMethod,
-            bookingRef: refNo,
-            status: "PAID",
-            paidAt: serverTimestamp()
-          });
+    const options = {
+      key: "rzp_test_S65eOkVzHn838L", 
+      amount: 400 * 100,
+      currency: "INR",
+      name: "Soil Testing Service",
+      description: "Laboratory Soil Analysis",
+      handler: async function (response: any) {
+        const refNo = response.razorpay_payment_id;
+        setBookingRef(refNo);
+        try {
+          if (docId) {
+            await updateDoc(doc(db, "soil_tests", docId), {
+              paymentMethod,
+              bookingRef: refNo,
+              status: "PAID",
+              paidAt: serverTimestamp()
+            });
+          }
+          setIsProcessingPayment(false);
+          setStep(3);
+        } catch (e) {
+          setIsProcessingPayment(false);
         }
-        setIsProcessingPayment(false);
-        setStep(3); // Go to Tracking
-      } catch (error) {
-        console.error("Payment update failed:", error);
-        setIsProcessingPayment(false);
-      }
-    }, 2000);
+      },
+      prefill: {
+        name: farmerName,
+        email: user?.email || "",
+        contact: user?.phone || "",
+      },
+      theme: { color: "#d97706" },
+    };
+
+    const rzp = new (window as any).Razorpay(options);
+    rzp.open();
   };
 
   /* ===============================
-     STEP 4: REPORT UPLOAD (Firestore Update)
+     STEP 4 & 5: AI LOGIC
      =============================== */
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
     const reader = new FileReader();
     reader.onloadend = async () => {
       const base64 = reader.result as string;
       setReportFile(base64);
-
-      // Simulation of data extraction
-      const extractedText = `Soil Test Results for Sample ${bookingRef || "KV-X"} (Owner: ${farmerName}, Area: ${testArea} Acres): Nitrogen: Low (180kg/ha), Phosphorus: Medium (22kg/ha), Potassium: High (350kg/ha), pH: 6.2, Organic Carbon: 0.35%, Micronutrients: Zinc Deficiency.`;
+      const extractedText = `Soil Test Results (${farmerName}): Nitrogen Low, Phosphorus Medium, Potassium High, pH 6.2`;
       setReportText(extractedText);
-
-      if (docId) {
-        await updateDoc(doc(db, "soil_tests", docId), {
-          reportFile: base64,
-          reportText: extractedText,
-          status: "REPORT_UPLOADED"
-        });
-      }
     };
     reader.readAsDataURL(file);
   };
 
-  /* ===============================
-     STEP 5: AI ANALYSIS (Firestore Update)
-     =============================== */
   const handleAnalyzeReport = async () => {
     if (!reportText) return;
     setLoading(true);
     try {
       const result = await getFertilizerRecommendation(reportText, parseFloat(testArea));
       setRecommendation(result);
-
       if (docId) {
         await updateDoc(doc(db, "soil_tests", docId), {
           aiRecommendation: result,
@@ -142,9 +204,8 @@ const SoilTesting: React.FC<SoilTestingProps> = ({ lang, user }) => {
         });
       }
       setStep(5);
-    } catch (e) {
-      console.error(e);
-      alert("AI Analysis failed. Please try again.");
+    } catch {
+      alert("AI analysis failed");
     } finally {
       setLoading(false);
     }
@@ -158,6 +219,9 @@ const SoilTesting: React.FC<SoilTestingProps> = ({ lang, user }) => {
     { n: 5, icon: '✨', label: 'Analysis' }
   ];
 
+  const ErrorLabel = ({ msg }: { msg?: string }) => 
+    msg ? <p className="text-rose-500 text-[10px] font-bold mt-1 ml-1 animate-pulse">{msg}</p> : null;
+
   return (
     <div className="p-6 md:p-12 max-w-5xl mx-auto animate-fade-in-up">
       <div className="bg-white rounded-[2.5rem] shadow-2xl shadow-amber-900/10 overflow-hidden border border-stone-100">
@@ -168,7 +232,7 @@ const SoilTesting: React.FC<SoilTestingProps> = ({ lang, user }) => {
           <div className="relative z-10">
             <span className="inline-block px-4 py-1.5 bg-white/20 backdrop-blur rounded-full text-[10px] font-black uppercase tracking-[0.2em] mb-4">Laboratory Service</span>
             <h2 className="text-4xl md:text-5xl font-black mb-3 leading-tight">{t.soilTitle}</h2>
-            <p className="text-lg font-medium opacity-90 max-w-xl">From field collection to AI-driven nutrient prescriptions.</p>
+            <p className="text-lg font-medium opacity-90 max-w-xl">Laboratory analysis & AI-driven prescriptions.</p>
           </div>
         </div>
 
@@ -204,97 +268,78 @@ const SoilTesting: React.FC<SoilTestingProps> = ({ lang, user }) => {
                         <input 
                           type="text"
                           value={farmerName}
-                          onChange={(e) => setFarmerName(e.target.value)}
-                          placeholder="Farmer's Full Name"
-                          className="w-full p-4 bg-stone-50 border border-stone-200 rounded-2xl focus:ring-2 focus:ring-amber-500 outline-none font-bold text-stone-700"
+                          onChange={(e) => handleInputChange(setFarmerName, 'farmerName', e.target.value)}
+                          className={`w-full p-4 bg-stone-50 border ${errors.farmerName ? 'border-rose-400' : 'border-stone-200'} rounded-2xl focus:ring-2 focus:ring-amber-500 outline-none font-bold text-stone-700 transition-all`}
                         />
+                        <ErrorLabel msg={errors.farmerName} />
                       </div>
+
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-1">
-                          <label className="text-[10px] font-black uppercase text-stone-400 ml-1">Area (Acres)</label>
-                          <input 
-                            type="number"
-                            value={testArea}
-                            onChange={(e) => setTestArea(e.target.value)}
-                            placeholder="e.g. 5"
-                            className="w-full p-4 bg-stone-50 border border-stone-200 rounded-2xl focus:ring-2 focus:ring-amber-500 outline-none font-bold text-stone-700"
-                          />
+                          <label className="text-[10px] font-black uppercase text-stone-400 ml-1">Test Area</label>
+                          <div className="flex gap-2">
+                             <input 
+                                type="number"
+                                value={testArea}
+                                onChange={(e) => handleInputChange(setTestArea, 'testArea', e.target.value)}
+                                placeholder="0"
+                                className={`w-full p-4 bg-stone-50 border ${errors.testArea ? 'border-rose-400' : 'border-stone-200'} rounded-2xl focus:ring-2 focus:ring-amber-500 outline-none font-bold text-stone-700`}
+                             />
+                             <select 
+                                value={areaUnit}
+                                onChange={(e) => setAreaUnit(e.target.value)}
+                                className="w-24 p-4 bg-amber-50 border border-amber-100 rounded-2xl font-bold text-amber-700 outline-none"
+                             >
+                                <option value="Acres">Acres</option>
+                                <option value="Hectares">Hec</option>
+                                <option value="Guntha">Gun</option>
+                             </select>
+                          </div>
+                          <ErrorLabel msg={errors.testArea} />
                         </div>
                         <div className="space-y-1">
                           <label className="text-[10px] font-black uppercase text-stone-400 ml-1">Preferred Date</label>
                           <input 
                             type="date"
+                            min={dateLimits.min}
+                            max={dateLimits.max}
                             value={bookingDate}
-                            onChange={(e) => setBookingDate(e.target.value)}
-                            className="w-full p-4 bg-stone-50 border border-stone-200 rounded-2xl focus:ring-2 focus:ring-amber-500 outline-none font-bold text-stone-700"
+                            onChange={(e) => handleInputChange(setBookingDate, 'bookingDate', e.target.value)}
+                            className={`w-full p-4 bg-stone-50 border ${errors.bookingDate ? 'border-rose-400' : 'border-stone-200'} rounded-2xl focus:ring-2 focus:ring-amber-500 outline-none font-bold text-stone-700`}
                           />
+                          <ErrorLabel msg={errors.bookingDate} />
                         </div>
                       </div>
                     </div>
                  </div>
                  
-                 <div className="space-y-4">
+                 <div className="space-y-1 flex flex-col">
                     <label className="text-[10px] font-black uppercase text-stone-400 ml-1">{t.address} & Landmark</label>
                     <textarea 
                       rows={8}
                       value={location}
-                      onChange={(e) => setLocation(e.target.value)}
-                      placeholder="Enter the farm location address..."
-                      className="w-full p-6 bg-stone-50 border border-stone-200 rounded-3xl focus:ring-2 focus:ring-amber-500 outline-none font-bold text-stone-700 shadow-inner resize-none"
+                      onChange={(e) => handleInputChange(setLocation, 'location', e.target.value)}
+                      placeholder="Enter the full farm address for sample collection..."
+                      className={`flex-1 w-full p-6 bg-stone-50 border ${errors.location ? 'border-rose-400' : 'border-stone-200'} rounded-3xl focus:ring-2 focus:ring-amber-500 outline-none font-bold text-stone-700 shadow-inner resize-none transition-all`}
                     />
+                    <ErrorLabel msg={errors.location} />
                  </div>
               </div>
-              <button 
-                onClick={handleBook}
-                disabled={!farmerName || !testArea || !bookingDate || !location}
-                className="w-full py-5 bg-stone-900 text-white font-black rounded-[2rem] hover:bg-amber-600 transition-all shadow-2xl disabled:bg-stone-200 disabled:text-stone-400 uppercase tracking-[0.2em] text-sm mt-4"
-              >
+              <button onClick={handleBook} className="w-full py-5 bg-stone-900 text-white font-black rounded-[2rem] hover:bg-amber-600 transition-all shadow-2xl uppercase tracking-widest text-sm mt-4">
                 Proceed to Secure Payment
               </button>
             </div>
           )}
 
-          {/* Step 2: Payment Gateway */}
+          {/* Step 2: Payment */}
           {step === 2 && (
             <div className="max-w-xl mx-auto space-y-8 py-8 animate-in fade-in zoom-in-95 duration-500">
                <div className="text-center space-y-2">
                   <h3 className="text-3xl font-black text-stone-900">Secure Payment</h3>
-                  <p className="text-stone-500 font-medium">Service Fee: <span className="text-stone-900 font-black">₹400.00</span></p>
+                  <p className="text-stone-500 font-medium">Fee: <span className="text-stone-900 font-black">₹400.00</span></p>
                </div>
-
-               <div className="bg-stone-50 rounded-[2.5rem] p-8 border border-stone-200 space-y-6">
-                  <div className="flex flex-col gap-3">
-                      <label className="text-[10px] font-black uppercase text-stone-400 ml-1">Choose Payment Method</label>
-                      <div className="grid grid-cols-1 gap-3">
-                        {[
-                          { id: 'upi', label: 'UPI / Google Pay / PhonePe', icon: '📱' },
-                          { id: 'card', label: 'Debit / Credit Card', icon: '💳' },
-                          { id: 'netbanking', label: 'Net Banking', icon: '🏛️' }
-                        ].map((method) => (
-                           <button
-                              key={method.id}
-                              onClick={() => setPaymentMethod(method.id as any)}
-                              className={`flex items-center gap-4 p-5 rounded-2xl border-2 transition-all ${
-                                paymentMethod === method.id 
-                                ? 'bg-white border-emerald-500 shadow-md ring-2 ring-emerald-100' 
-                                : 'bg-transparent border-stone-200 text-stone-500'
-                              }`}
-                           >
-                              <span className="text-2xl">{method.icon}</span>
-                              <span className="font-bold text-stone-800">{method.label}</span>
-                              {paymentMethod === method.id && <span className="ml-auto text-emerald-500">✓</span>}
-                           </button>
-                        ))}
-                      </div>
-                  </div>
-               </div>
-
-               <button
-                  onClick={handlePayment}
-                  disabled={isProcessingPayment}
-                  className="w-full py-5 bg-emerald-600 text-white font-black rounded-[2rem] hover:bg-emerald-700 transition-all shadow-xl flex items-center justify-center gap-3 uppercase tracking-widest text-sm"
-               >
-                  {isProcessingPayment ? 'Verifying Payment...' : 'Pay ₹400.00 Now'}
+               <button onClick={handlePayment} className="w-full py-5 bg-emerald-600 text-white font-black rounded-[2rem] hover:bg-emerald-700 transition-all shadow-xl flex items-center justify-center gap-3 uppercase tracking-widest text-sm">
+                  {isProcessingPayment ? 'Connecting...' : 'Confirm and Pay ₹400'}
                </button>
             </div>
           )}
@@ -302,88 +347,70 @@ const SoilTesting: React.FC<SoilTestingProps> = ({ lang, user }) => {
           {/* Step 3: Tracking */}
           {step === 3 && (
             <div className="text-center space-y-8 py-12 animate-in fade-in duration-700">
-              <div className="relative text-7xl">🚛</div>
-              <div className="space-y-2">
-                <div className="inline-flex items-center gap-2 px-4 py-1.5 bg-emerald-100 text-emerald-700 text-[10px] font-black rounded-full tracking-[0.2em] uppercase mb-2">Payment Verified</div>
-                <h3 className="text-3xl font-black text-stone-900 mb-2">Tracking ID: {bookingRef}</h3>
-                <p className="text-stone-500 font-medium max-w-md mx-auto text-lg leading-relaxed">
-                  Our executive is scheduled for {new Date(bookingDate).toLocaleDateString()}.
-                </p>
-              </div>
-              <button 
-                onClick={() => setStep(4)}
-                className="px-10 py-4 bg-stone-900 text-white font-black rounded-full hover:bg-emerald-600 transition-all uppercase tracking-widest text-xs shadow-xl"
-              >
-                I have received my Report
+              <div className="relative text-7xl mb-4">🚛</div>
+              <h3 className="text-3xl font-black text-stone-900">Slot Confirmed</h3>
+              <p className="text-stone-500 font-medium max-w-md mx-auto text-lg">
+                Sample collection scheduled for <span className="text-stone-900 font-black">{new Date(bookingDate).toLocaleDateString()}</span>.
+              </p>
+              <button onClick={() => setStep(4)} className="px-10 py-4 bg-stone-900 text-white font-black rounded-full hover:bg-emerald-600 transition-all uppercase tracking-widest text-xs">
+                Go to Upload Report
               </button>
             </div>
           )}
 
-          {/* Step 4: Upload Report */}
+          {/* Step 4: Upload */}
           {step === 4 && (
-            <div className="space-y-8 animate-in fade-in duration-700">
-               <div className="text-center max-w-xl mx-auto space-y-4 mb-10">
-                  <h3 className="text-3xl font-black text-stone-900">4. Submit Lab Report</h3>
-                  <p className="text-stone-500 font-medium leading-relaxed">Upload your report file here for AI analysis.</p>
-               </div>
-
-               <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+            <div className="space-y-8 animate-in fade-in duration-700 text-center">
+               <h3 className="text-3xl font-black text-stone-900">Step 4: Report Analysis</h3>
+               <div className="grid grid-cols-1 md:grid-cols-2 gap-8 text-left">
                   <div className="space-y-4">
                      <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept="image/*,application/pdf" />
-                     <div 
-                        onClick={() => fileInputRef.current?.click()}
-                        className="w-full h-64 border-4 border-dashed border-stone-100 rounded-[2.5rem] flex flex-col items-center justify-center cursor-pointer hover:bg-stone-50 transition-all"
-                     >
-                        {reportFile ? <p className="text-emerald-600 font-black">📄 Report Selected</p> : <p className="text-stone-400 font-black">Tap to upload lab report</p>}
+                     <div onClick={() => fileInputRef.current?.click()} className="w-full h-64 border-4 border-dashed border-stone-100 rounded-[2.5rem] flex flex-col items-center justify-center cursor-pointer hover:bg-stone-50 transition-all">
+                        {reportFile ? <p className="text-emerald-600 font-black">📄 Report Selected</p> : <p className="text-stone-400 font-black uppercase text-xs">Upload Lab Report</p>}
                      </div>
                   </div>
-
-                  <div className="space-y-4">
-                     <textarea 
-                        rows={6}
-                        value={reportText}
-                        onChange={(e) => setReportText(e.target.value)}
-                        placeholder="Manual lab values..."
-                        className="w-full p-6 bg-stone-50 border border-stone-200 rounded-[2.5rem] font-bold text-stone-700 shadow-inner resize-none"
-                     />
-                  </div>
+                  <textarea rows={6} value={reportText} onChange={(e) => setReportText(e.target.value)} className="w-full p-6 bg-stone-50 border border-stone-200 rounded-[2.5rem] font-bold text-stone-700 shadow-inner resize-none" />
                </div>
-
-               <button 
-                onClick={handleAnalyzeReport}
-                disabled={loading || !reportText}
-                className="w-full py-5 bg-stone-900 text-white font-black rounded-[2rem] hover:bg-emerald-600 transition-all shadow-2xl disabled:bg-stone-200 uppercase tracking-[0.2em] text-sm"
-              >
-                {loading ? 'AI ANALYZING...' : 'GENERATE CUSTOM FERTILIZER PLAN'}
-              </button>
+               <button onClick={handleAnalyzeReport} disabled={loading || !reportText} className="w-full py-5 bg-stone-900 text-white font-black rounded-[2rem] hover:bg-emerald-600 transition-all shadow-2xl disabled:bg-stone-200 uppercase tracking-widest text-sm">
+                 {loading ? 'AI RUNNING...' : 'GENERATE AI FERTILIZER PRESCRIPTION'}
+               </button>
             </div>
           )}
 
-          {/* Step 5: AI Results */}
+          {/* Step 5: Final AI Results */}
           {step === 5 && (
             <div className="space-y-8 animate-in zoom-in-95 duration-500">
-              <h3 className="text-3xl font-black text-stone-900">Prescription for {testArea} Acres</h3>
+              <div className="flex justify-between items-end border-b pb-6">
+                 <div>
+                    <h3 className="text-3xl font-black text-stone-900">Soil Prescription</h3>
+                    <p className="text-stone-500 font-bold uppercase text-xs mt-1">For {testArea} {areaUnit} Area</p>
+                 </div>
+              </div>
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-                 <div className="lg:col-span-2 prose prose-stone max-w-none bg-stone-50/50 p-10 rounded-[2.5rem] border border-stone-200 whitespace-pre-wrap font-medium text-lg shadow-inner">
+                 <div className="lg:col-span-2 bg-stone-50 p-10 rounded-[2.5rem] border border-stone-200 whitespace-pre-wrap font-medium text-lg text-stone-800 leading-relaxed shadow-inner">
                     {recommendation}
                  </div>
                  <div className="space-y-6">
-                    <div className="bg-white p-6 rounded-3xl border border-stone-100 shadow-sm">
-                       <h4 className="text-sm font-black text-stone-400 uppercase mb-4">Total Requirement</h4>
-                       <p className="font-bold text-stone-700">Urea: {(parseFloat(testArea) * 45).toFixed(1)} kg</p>
-                       <p className="font-bold text-stone-700">DAP: {(parseFloat(testArea) * 30).toFixed(1)} kg</p>
+                    <div className="bg-emerald-50 p-6 rounded-3xl border border-emerald-100 shadow-sm">
+                       <h4 className="text-xs font-black text-emerald-600 uppercase mb-4 tracking-widest">Requirement Estimator</h4>
+                       <div className="space-y-3">
+                          <div className="flex justify-between border-b border-emerald-100 pb-2">
+                             <span className="font-bold text-stone-600">Urea:</span>
+                             <span className="font-black text-emerald-700">{(parseFloat(testArea) * 45).toFixed(1)} kg</span>
+                          </div>
+                          <div className="flex justify-between border-b border-emerald-100 pb-2">
+                             <span className="font-bold text-stone-600">DAP:</span>
+                             <span className="font-black text-emerald-700">{(parseFloat(testArea) * 30).toFixed(1)} kg</span>
+                          </div>
+                       </div>
                     </div>
-                    <button 
-                      onClick={() => { setStep(1); setRecommendation(null); setReportText(''); setReportFile(null); }}
-                      className="w-full py-4 border-2 border-amber-600 text-amber-600 font-black rounded-2xl hover:bg-amber-50 uppercase tracking-widest text-[11px]"
-                    >
-                      Book New Soil Test
+                    <button onClick={() => { setStep(1); setRecommendation(null); setReportText(''); setReportFile(null); setBookingDate(''); setTestArea(''); }} className="w-full py-4 border-2 border-amber-600 text-amber-600 font-black rounded-2xl hover:bg-amber-50 uppercase tracking-widest text-[11px]">
+                      Book New Test Slot
                     </button>
                  </div>
               </div>
             </div>
           )}
-
         </div>
       </div>
     </div>

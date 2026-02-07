@@ -19,7 +19,8 @@ import {
   Tooltip,
   ResponsiveContainer,
   CartesianGrid,
-  Cell
+  Cell,
+  Label // Added Label import just in case, though we'll use the prop
 } from "recharts";
 
 /* ===============================
@@ -53,9 +54,6 @@ const LiveRates: React.FC<LiveRatesProps> = ({ lang }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  /* ===============================
-     🔥 CACHED FETCH (UPDATED FOR MULTIPLE PRICES)
-     =============================== */
   const getCachedMarketRates = async (
     commodity: string,
     district: string
@@ -85,13 +83,31 @@ const LiveRates: React.FC<LiveRatesProps> = ({ lang }) => {
     if (!text.startsWith("{")) return [];
     const data = JSON.parse(text);
 
-    // Capture Min, Max, and Modal prices
-    const parsedRates: Rate[] = data.records?.map((r: any) => ({
-      market: r.Market,
-      modalPrice: Number(r.Modal_Price),
-      minPrice: Number(r.Min_Price),
-      maxPrice: Number(r.Max_Price)
-    })) || [];
+    const rawRecords = data.records || [];
+    const marketGroups = rawRecords.reduce((acc: any, record: any) => {
+      const marketName = record.Market;
+      if (!acc[marketName]) {
+        acc[marketName] = {
+          market: marketName,
+          minTotal: 0,
+          maxTotal: 0,
+          modalTotal: 0,
+          count: 0
+        };
+      }
+      acc[marketName].minTotal += Number(record.Min_Price);
+      acc[marketName].maxTotal += Number(record.Max_Price);
+      acc[marketName].modalTotal += Number(record.Modal_Price);
+      acc[marketName].count += 1;
+      return acc;
+    }, {});
+
+    const parsedRates: Rate[] = Object.values(marketGroups).map((m: any) => ({
+      market: m.market,
+      minPrice: Math.round(m.minTotal / m.count),
+      maxPrice: Math.round(m.maxTotal / m.count),
+      modalPrice: Math.round(m.modalTotal / m.count)
+    }));
 
     try {
       await setDoc(ref, { district, commodity, date, rates: parsedRates, createdAt: serverTimestamp() });
@@ -117,71 +133,88 @@ const LiveRates: React.FC<LiveRatesProps> = ({ lang }) => {
     loadRates();
   }, [commodity, district]);
 
-  // Find highest and lowest modal prices for UI highlights
-  const maxModal = Math.max(...rates.map(r => r.modalPrice), 0);
-  const minModal = Math.min(...rates.map(r => r.modalPrice), Infinity);
+  const maxModal = rates.length > 0 ? Math.max(...rates.map(r => r.modalPrice)) : 0;
 
   return (
     <div className="p-6 md:p-12 max-w-7xl mx-auto space-y-12 animate-fade-in-up">
       
-      {/* 🔽 TOP SECTION: FILTERS */}
-      <section className="bg-white p-8 md:p-10 rounded-[2.5rem] shadow-xl border border-stone-100 relative overflow-hidden">
+      {/* 🔽 FILTERS */}
+      <section className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-stone-100 relative overflow-hidden">
         <div className="absolute top-0 left-0 w-full h-2 bg-emerald-500" />
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-8">
+        <div className="flex flex-col md:flex-row justify-between gap-8">
             <h2 className="text-3xl font-black text-stone-900 flex items-center gap-3">
-                <span className="p-3 bg-emerald-100 rounded-2xl text-2xl">📈</span> {t.liveMandi}
+                <span className="p-3 bg-emerald-100 rounded-2xl">📈</span> {t.liveMandi}
             </h2>
 
             <div className="flex flex-wrap gap-4">
-                <div className="space-y-1">
-                    <label className="text-[10px] font-black uppercase text-stone-400 ml-1">Select District</label>
-                    <select
-                        value={district}
-                        onChange={(e) => setDistrict(e.target.value)}
-                        className="block w-full md:w-48 p-4 bg-stone-50 border border-stone-200 rounded-2xl focus:ring-2 focus:ring-emerald-500 outline-none font-bold text-stone-800 appearance-none cursor-pointer"
-                    >
-                        {DISTRICTS.map((d) => <option key={d} value={d}>{d}</option>)}
-                    </select>
-                </div>
+                <select
+                    value={district}
+                    onChange={(e) => setDistrict(e.target.value)}
+                    className="p-4 bg-stone-50 border border-stone-200 rounded-2xl font-bold outline-none"
+                >
+                    {DISTRICTS.map((d) => <option key={d} value={d}>{d}</option>)}
+                </select>
 
-                <div className="space-y-1">
-                    <label className="text-[10px] font-black uppercase text-stone-400 ml-1">Select Commodity</label>
-                    <select
-                        value={commodity}
-                        onChange={(e) => setCommodity(e.target.value)}
-                        className="block w-full md:w-48 p-4 bg-stone-50 border border-stone-200 rounded-2xl focus:ring-2 focus:ring-emerald-500 outline-none font-bold text-stone-800 appearance-none cursor-pointer"
-                    >
-                        {COMMODITIES.map((c) => <option key={c} value={c}>{c}</option>)}
-                    </select>
-                </div>
+                <select
+                    value={commodity}
+                    onChange={(e) => setCommodity(e.target.value)}
+                    className="p-4 bg-stone-50 border border-stone-200 rounded-2xl font-bold outline-none"
+                >
+                    {COMMODITIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
             </div>
         </div>
       </section>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
         
-        {/* 📊 CHART MODULE (Shows Price Variation) */}
-        <section className="bg-white p-8 md:p-10 rounded-[2.5rem] shadow-xl border border-stone-100">
-          <div className="flex justify-between items-center mb-10">
-            <h3 className="text-2xl font-black text-stone-900">Price Comparison</h3>
-            <span className="text-[10px] bg-stone-100 text-stone-500 px-3 py-1 rounded-full font-black uppercase tracking-widest">
-              {commodity}
-            </span>
-          </div>
-
-          <div className="h-80 w-full">
+        {/* 📊 CHART WITH AXIS LABELS */}
+        <section className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-stone-100">
+          <h3 className="text-2xl font-black mb-10">Market Price Comparison</h3>
+          <div className="h-96 w-full"> {/* Increased height slightly for labels */}
             {rates.length > 0 && !loading ? (
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={rates}>
+                <BarChart data={rates} margin={{ bottom: 20, left: 10 }}>
                   <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f5f5f4" />
-                  <XAxis dataKey="market" axisLine={false} tickLine={false} tick={{fontSize: 10, fontWeight: 800, fill: '#a8a29e'}} />
-                  <YAxis axisLine={false} tickLine={false} tick={{fontSize: 10, fontWeight: 800, fill: '#a8a29e'}} />
+                  
+                  {/* X-AXIS WITH LABEL */}
+                  <XAxis 
+                    dataKey="market" 
+                    axisLine={false} 
+                    tickLine={false} 
+                    tick={{fontSize: 10, fontWeight: 800}}
+                    height={60}
+                    label={{ 
+                        value: "Markets / Mandis", 
+                        position: "insideBottom", 
+                        offset: 0, 
+                        fontSize: 12, 
+                        fontWeight: 900,
+                        fill: "#78716c" 
+                    }} 
+                  />
+                  
+                  {/* Y-AXIS WITH LABEL */}
+                  <YAxis 
+                    axisLine={false} 
+                    tickLine={false} 
+                    tick={{fontSize: 10, fontWeight: 800}}
+                    width={70}
+                    label={{ 
+                        value: "Price (₹/Quintal)", 
+                        angle: -90, 
+                        position: "insideLeft", 
+                        fontSize: 12, 
+                        fontWeight: 900,
+                        fill: "#78716c" 
+                    }}
+                  />
+                  
                   <Tooltip 
                     cursor={{fill: '#f5f5f4'}} 
-                    contentStyle={{ borderRadius: '1rem', border: 'none', boxShadow: '0 10px 15px -3px rgb(0 0 0 / 0.1)' }}
-                    formatter={(value, name) => [`₹${value}`, name === 'modalPrice' ? 'Modal Price' : name]}
+                    contentStyle={{ borderRadius: '1rem', border: 'none' }}
                   />
-                  <Bar dataKey="modalPrice" radius={[8, 8, 0, 0]} name="Price (₹)">
+                  <Bar dataKey="modalPrice" radius={[8, 8, 0, 0]}>
                     {rates.map((entry, index) => (
                       <Cell key={`cell-${index}`} fill={entry.modalPrice === maxModal ? '#10b981' : '#d6d3d1'} />
                     ))}
@@ -189,65 +222,34 @@ const LiveRates: React.FC<LiveRatesProps> = ({ lang }) => {
                 </BarChart>
               </ResponsiveContainer>
             ) : (
-              <div className="h-full flex flex-col items-center justify-center text-stone-300 space-y-4">
-                 <div className="text-6xl opacity-30 animate-pulse">📊</div>
-                 <p className="font-bold text-sm tracking-widest uppercase">{loading ? 'Loading...' : 'No Data'}</p>
+              <div className="h-full flex items-center justify-center font-bold text-stone-400">
+                {loading ? 'Loading...' : 'No Data Available'}
               </div>
             )}
           </div>
-          
-          <div className="mt-8 p-6 bg-emerald-50 rounded-3xl border border-emerald-100">
-             <p className="text-sm text-emerald-700 font-medium leading-relaxed">
-               The <span className="text-emerald-600 font-bold underline">green bar</span> indicates the market offering the <b>highest modal price</b> for {commodity} in {district} today.
-             </p>
-          </div>
         </section>
 
-        {/* 📋 LIST MODULE (Shows Different Prices: Min, Max, Modal) */}
-        <section className="bg-white p-8 md:p-10 rounded-[2.5rem] shadow-xl border border-stone-100 flex flex-col">
-          <h3 className="text-2xl font-black text-stone-900 mb-8">Detailed Market Rates</h3>
-          
-          <div className="flex-grow space-y-4 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
-            {loading ? (
-                [1,2,3].map(i => (
-                    <div key={i} className="h-24 w-full bg-stone-50 animate-pulse rounded-[2rem]" />
-                ))
-            ) : error ? (
-                <div className="text-center py-12 text-rose-400 font-black uppercase text-xs tracking-widest">{error}</div>
-            ) : rates.length === 0 ? (
-                <div className="text-center py-12 text-stone-300 font-black uppercase text-[10px] tracking-[0.2em]">No records found for today</div>
-            ) : (
-                rates.map((r, i) => (
-                  <div key={i} className="flex items-center justify-between p-6 bg-stone-50 rounded-[2rem] border border-stone-100 hover:border-emerald-200 transition-all group">
-                    <div className="space-y-1">
-                      <div className="font-black text-lg text-stone-900 flex items-center gap-2">
-                        {r.market}
-                        {r.modalPrice === maxModal && <span className="text-[8px] bg-emerald-500 text-white px-2 py-0.5 rounded-full uppercase tracking-tighter">Best Rate</span>}
-                      </div>
-                      <div className="flex gap-3">
-                        <div className="text-[9px] font-black text-stone-400 uppercase tracking-widest bg-white px-2 py-1 rounded-md border border-stone-200">
-                          Min: <span className="text-stone-600">₹{r.minPrice}</span>
-                        </div>
-                        <div className="text-[9px] font-black text-stone-400 uppercase tracking-widest bg-white px-2 py-1 rounded-md border border-stone-200">
-                          Max: <span className="text-stone-600">₹{r.maxPrice}</span>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="text-right">
-                      <div className={`text-2xl font-black ${r.modalPrice === maxModal ? 'text-emerald-600' : 'text-stone-900'}`}>
-                        ₹{r.modalPrice.toLocaleString("en-IN")}
-                      </div>
-                      <p className="text-[9px] text-stone-400 font-bold uppercase tracking-tighter">Modal Price / Qtl</p>
-                    </div>
+        {/* 📋 LIST */}
+        <section className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-stone-100 flex flex-col">
+          <h3 className="text-2xl font-black mb-8">Average Market Rates</h3>
+          <div className="flex-grow space-y-4 max-h-[500px] overflow-y-auto pr-2">
+            {rates.map((r, i) => (
+              <div key={i} className="flex items-center justify-between p-6 bg-stone-50 rounded-[2rem] border border-stone-100">
+                <div className="space-y-1">
+                  <div className="font-black text-lg text-stone-900">{r.market}</div>
+                  <div className="flex gap-2">
+                    <span className="text-[9px] bg-white border p-1 rounded font-bold uppercase">Avg Min: ₹{r.minPrice}</span>
+                    <span className="text-[9px] bg-white border p-1 rounded font-bold uppercase">Avg Max: ₹{r.maxPrice}</span>
                   </div>
-                ))
-            )}
-          </div>
-
-          <div className="mt-6 text-center">
-            <span className="text-[10px] text-stone-400 font-black uppercase tracking-[0.3em]">
-              Source: Agmarknet (Updated Daily)
-            </span>
+                </div>
+                <div className="text-right">
+                  <div className={`text-2xl font-black ${r.modalPrice === maxModal ? 'text-emerald-600' : 'text-stone-900'}`}>
+                    ₹{r.modalPrice.toLocaleString("en-IN")}
+                  </div>
+                  <p className="text-[9px] text-stone-400 font-bold uppercase">Avg Modal Price</p>
+                </div>
+              </div>
+            ))}
           </div>
         </section>
       </div>
